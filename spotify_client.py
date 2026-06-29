@@ -213,7 +213,7 @@ class SpotifyClient:
         """
         Look up metadata for a Spotify track URI.
         Returns a dict with:
-            title, artist, album, artist_uri, album_uri
+            title, artist, album, artist_uri, album_uri, artists (list)
         or None on failure.
         """
         result = self.run_cli("lookup", uri)
@@ -232,16 +232,22 @@ class SpotifyClient:
             logger.error("Unexpected lookup format: %s", lines[0] if lines else "no output")
             return None
 
+        # --- FIX: Accumulate artists across multiple lines ---
+        all_artists = []
+
         # Parse "By:" and "From:" lines
         for line in lines[1:]:
             if line.startswith("  By: "):
                 rest = line[6:].strip()
-                if " (spotify:artist:" in rest:
+                if " (spotify:" in rest: # Catches both artist and user URIs
                     name_part, uri_part = rest.rsplit(" (", 1)
-                    info["artist"] = name_part.strip()
-                    info["artist_uri"] = uri_part.rstrip(")").strip()
+                    all_artists.append({
+                        "name": name_part.strip(),
+                        "uri": uri_part.rstrip(")").strip()
+                    })
                 else:
-                    info["artist"] = rest
+                    all_artists.append({"name": rest, "uri": ""})
+                    
             elif line.startswith("  From: "):
                 rest = line[8:].strip()
                 if " (spotify:album:" in rest:
@@ -250,6 +256,12 @@ class SpotifyClient:
                     info["album_uri"] = uri_part.rstrip(")").strip()
                 else:
                     info["album"] = rest
+
+        # Apply the accumulated artists back to the dictionary
+        if all_artists:
+            info["artists"] = all_artists
+            info["artist"] = ", ".join(a["name"] for a in all_artists)
+            info["artist_uri"] = all_artists[0]["uri"] # Main artist fallback
 
         # Ensure all keys exist
         for key in ("title", "artist", "album", "artist_uri", "album_uri"):

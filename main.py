@@ -1,17 +1,27 @@
 import sys
+sys.coinit_flags = 0
+
 import os
 import logging
 import time
 import ctypes
 import threading
+import traceback
+import warnings       # <--- NEW
+from pathlib import Path
 from ctypes import wintypes
 from PyQt5.QtCore import QTimer, QByteArray, QObject, pyqtSignal, QThread
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMessageBox
+
+import numpy as np
+import soundcard as sc
 
 from spotify_client import SpotifyClient
 from spotify_overlay import SpotifyOverlay
 from spotify_track_monitor import SpotifyTrackMonitor
 from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+
+warnings.filterwarnings("ignore", message="data discontinuity in recording") # <--- NEW
 
 # -------------------------------------------------------------------
 # Helper – close a window by process id (send WM_CLOSE)
@@ -53,13 +63,29 @@ def close_spotify_window_to_tray(pid: int, timeout: float = 10.0):
 # -------------------------------------------------------------------
 # Logging configuration
 # -------------------------------------------------------------------
+# Create a dedicated directory in AppData for logs
+app_data_dir = Path(os.getenv('APPDATA', os.path.expanduser('~'))) / 'TaskBarSpot'
+log_file_path = app_data_dir / 'taskbarspot.log'
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
-    stream=sys.stderr,
+    handlers=[
+        logging.FileHandler(log_file_path, encoding='utf-8'),
+        logging.StreamHandler(sys.stderr)
+    ]
 )
 logger = logging.getLogger("main")
+
+# Global exception handler to catch silent background crashes
+def handle_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical("Unhandled exception crashed the application:", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = handle_unhandled_exception
 
 # -------------------------------------------------------------------
 # Volume helpers
@@ -83,6 +109,96 @@ def set_spotify_volume(volume: float):
                 vol.SetMasterVolume(volume, None)
     except Exception as e:
         logger.warning("Volume set failed: %s", e)
+
+# -------------------------------------------------------------------
+# True Audio FFT Worker (Frequency Bands)
+# -------------------------------------------------------------------
+class AudioFFTWorker(QObject):
+    fftReady = pyqtSignal(list)
+
+    # --- FFT Configuration ---
+    FFT_SAMPLES = 1024           
+    AUTO_GAIN_DECAY = 0.98       
+    MIN_GAIN = 0.05              
+    
+    # --- Linear Frequency Scale Settings ---
+    NUM_BARS = 7
+    FREQ_CENTER = 600.0          # The exact middle of the visualizer (Bar 4 out of 7)
+    FREQ_MIN = 100.0              # The absolute left edge (Bar 1)
+    
+    # Music naturally has way more energy in the bass (left) than the mids (right).
+    # This multiplier slowly scales up from left to right to keep the visualizer balanced.
+    TREBLE_BOOST = 2           # Set to 1.0 for true raw data, or higher to boost the right side.
+
+    def __init__(self):
+        super().__init__()
+        self._running = True
+        self._rolling_max = self.MIN_GAIN
+
+    def run(self):
+        logger.info("AudioFFTWorker started")
+        try:
+            speaker = sc.default_speaker()
+            mics = sc.all_microphones(include_loopback=True)
+            loopback = next((m for m in mics if m.isloopback and m.name == speaker.name), None)
+
+            if not loopback:
+                logger.warning("Could not find loopback device. FFT visualizer disabled.")
+                return
+
+            # Math to figure out our frequency buckets
+            freq_delta = self.FREQ_CENTER - self.FREQ_MIN
+            freq_max = self.FREQ_CENTER + freq_delta 
+            hz_per_bar = (freq_max - self.FREQ_MIN) / self.NUM_BARS
+            
+            # 44100Hz samplerate / 1024 samples = ~43 Hz per FFT data point
+            hz_per_bin = 44100 / self.FFT_SAMPLES
+
+            with loopback.recorder(samplerate=44100) as mic:
+                while self._running:
+                    data = mic.record(numframes=self.FFT_SAMPLES)
+                    mono = data.mean(axis=1)
+                    fft_data = np.abs(np.fft.rfft(mono * np.hanning(len(mono))))
+
+                    bands = []
+                    
+                    # Dynamically slice the FFT data into 7 frequency buckets
+                    for i in range(self.NUM_BARS):
+                        start_hz = self.FREQ_MIN + (i * hz_per_bar)
+                        end_hz = start_hz + hz_per_bar
+                        
+                        # Convert Hertz to Array Indices
+                        start_bin = max(1, int(start_hz / hz_per_bin))
+                        end_bin = max(start_bin + 1, int(end_hz / hz_per_bin))
+                        
+                        # Safeguard in case user sets extremely high frequencies
+                        end_bin = min(end_bin, len(fft_data))
+                        
+                        # Extract the average volume for this specific frequency range
+                        band_val = float(np.mean(fft_data[start_bin:end_bin]))
+                        
+                        # Apply the gradual treble boost (0% boost on the left, 100% of TREBLE_BOOST on the right)
+                        boost_multiplier = 1.0 + (self.TREBLE_BOOST - 1.0) * (i / (self.NUM_BARS - 1))
+                        bands.append(band_val * boost_multiplier)
+
+                    # --- Auto-Gain Normalization ---
+                    current_max = max(bands)
+                    
+                    if current_max > self._rolling_max:
+                        self._rolling_max = current_max
+                    else:
+                        self._rolling_max = max(self.MIN_GAIN, self._rolling_max * self.AUTO_GAIN_DECAY)
+
+                    # Normalize all bands between 0.0 and 1.0
+                    normalized = [min(1.0, b / self._rolling_max) for b in bands]
+                    
+                    self.fftReady.emit(normalized)
+
+        except Exception as e:
+            logger.error(f"FFT Audio capture failed: {e}")
+
+    def stop(self):
+        self._running = False
 
 # -------------------------------------------------------------------
 # Background worker – fetches playback state, volume, and monitors exit
@@ -147,6 +263,19 @@ class BackgroundLookupBridge(QObject):
     actionVerified = pyqtSignal(str, bool) # context, status
 
 # -------------------------------------------------------------------
+# UI Helpers
+# -------------------------------------------------------------------
+def show_startup_error(message: str):
+    """Shows a popup for fatal startup errors only, logs it, and prevents silent startup failure."""
+    logger.critical(f"Startup Error: {message}")
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Critical)
+    msg.setWindowTitle("TaskBarSpot - Startup Error")
+    msg.setText("TaskBarSpot failed to start.")
+    msg.setInformativeText(message)
+    msg.exec_()
+
+# -------------------------------------------------------------------
 # Main application
 # -------------------------------------------------------------------
 def main():
@@ -167,7 +296,7 @@ def main():
             logger.info("Spotify desktop client not running, launching minimized…")
             proc = client.start_minimized()
             if proc is None or not client.wait_for_client(timeout=30.0):
-                logger.error("Failed to launch Spotify. Exiting.")
+                show_startup_error("Failed to launch Spotify within the timeout.")
                 sys.exit(1)
         else:
             logger.info("Spotify desktop client is already running.")
@@ -181,7 +310,10 @@ def main():
             client.run_cli("resume")
 
     except FileNotFoundError as e:
-        logger.error("Fatal error: %s", e)
+        show_startup_error(f"Required file not found:\n{e}")
+        sys.exit(1)
+    except Exception as e:
+        show_startup_error(f"An unexpected error occurred during startup:\n{e}")
         sys.exit(1)
 
     overlay = SpotifyOverlay()
@@ -250,14 +382,12 @@ def main():
     def handle_next():
         logger.info("Optimistic Next Track (Swiped/Clicked)")
         if prefetched_next:
-            # Visually snap to next track immediately
             overlay.set_track_info(prefetched_next.get("title", ""), prefetched_next.get("artist", ""))
         threading.Thread(target=client.run_cli, args=("next",), daemon=True).start()
 
     def handle_previous():
         logger.info("Optimistic Previous Track (Swiped/Clicked)")
         if history_stack:
-            # Visually snap to historical track immediately
             prev_info = history_stack[-1]
             thumb = prev_info.get("thumbnail", b"")
             overlay.set_track_info(
@@ -283,8 +413,12 @@ def main():
                 os.startfile(fallback)
         threading.Thread(target=task, daemon=True).start()
 
+    # Replace the old artistClicked lambda with this handler:
+    def handle_artist_click(uri_target):
+        open_link(uri_target if uri_target else link_state.get('artist_uri'))
+
     overlay.albumDoubleClicked.connect(lambda: open_link(link_state.get('album_uri')))
-    overlay.artistClicked.connect(lambda: open_link(link_state.get('artist_uri')))
+    overlay.artistClicked.connect(handle_artist_click) # <--- UPDATED
     overlay.titleClicked.connect(lambda: open_link("spotify:collection:tracks"))
     overlay.settingsClicked.connect(lambda: logger.info("Settings clicked"))
     overlay.volumeChanged.connect(set_spotify_volume)
@@ -299,6 +433,10 @@ def main():
         overlay.set_liked(saved)
         link_state.update(links)
         
+        # --- ADD THIS ---
+        if 'artists' in links and links['artists']:
+            overlay.set_artists(links['artists'])
+        
     def on_next_ready(meta: dict):
         nonlocal prefetched_next
         prefetched_next = meta
@@ -310,7 +448,7 @@ def main():
         """Fetches active metadata and looks one step ahead into the queue natively."""
         uri = client.now_playing()
         saved = False
-        links = {'artist_uri': '', 'album_uri': ''}
+        links = {'artist_uri': '', 'album_uri': '', 'artists': []} # <--- UPDATE THIS LINE
         
         if uri:
             saved = client.is_track_saved(uri) or False
@@ -318,6 +456,7 @@ def main():
             if meta:
                 links['artist_uri'] = meta.get("artist_uri", "")
                 links['album_uri'] = meta.get("album_uri", "")
+                links['artists'] = meta.get("artists", [])         # <--- ADD THIS LINE
         bg_bridge.metaReady.emit(uri or "", links, saved)
         
         # Pre-fetch the next track in the queue silently
@@ -342,23 +481,17 @@ def main():
         title = info.get("title", "Unknown Title")
         artist = info.get("artist", "")
         
-        # Memory Caching logic:
         cache_key = f"{title}|{artist}"
         thumb = info.get("thumbnail", b"")
         
         if thumb:
-            # If we got a real image, cache it
             album_byte_cache[cache_key] = thumb
         elif cache_key in album_byte_cache:
-            # If Windows failed/delayed the image, but we've seen it before, grab it from memory instantly!
             thumb = album_byte_cache[cache_key]
         
-        # Intelligent History tracking (handles skips vs backward skips)
         if history_stack and history_stack[-1].get("title") == title:
-            # We stepped backward - remove the current track so history stays aligned
             history_stack.pop()
         elif current_track_info and current_track_info.get("title") != title:
-            # We stepped forward - save the exiting track
             if not history_stack or history_stack[-1].get("title") != current_track_info.get("title"):
                 history_stack.append(current_track_info)
                 if len(history_stack) > 20:
@@ -366,20 +499,29 @@ def main():
 
         current_track_info = info
         current_track_start = time.time()
-        prefetched_next = None # clear old cache immediately
+        prefetched_next = None
         
-        # 1. Update UI visually and instantly
         overlay.set_track_info(title, artist, QByteArray(thumb) if thumb else QByteArray())
         overlay.set_playing(True)
         state['playing'] = True
         
-        # 2. Kick off the heavy CLI fetching in a background thread
         threading.Thread(target=fetch_heavy_metadata_bg, daemon=True).start()
 
     track_bridge.trackChanged.connect(on_track_changed)
     
     monitor = SpotifyTrackMonitor(track_bridge.on_track_change)
     monitor.start()
+
+    # -------------------------------------------------------------------
+    # True FFT Audio Polling (30 FPS)
+    # -------------------------------------------------------------------
+    peak_worker = AudioFFTWorker()
+    peak_thread = QThread()
+    peak_worker.moveToThread(peak_thread)
+    peak_thread.started.connect(peak_worker.run)
+    peak_thread.start()
+    
+    peak_worker.fftReady.connect(overlay.set_fft_bands)
 
     # -------------------------------------------------------------------
     # Background Status Polling (State Recovery)
@@ -405,6 +547,9 @@ def main():
     # -------------------------------------------------------------------
     def cleanup():
         logger.info("Shutting down…")
+        peak_worker.stop()
+        peak_thread.quit()
+        peak_thread.wait()
         worker.stop()
         worker_thread.quit()
         worker_thread.wait()

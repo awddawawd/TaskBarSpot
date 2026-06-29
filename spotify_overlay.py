@@ -5,11 +5,13 @@ On hover, the full text is shown immediately with a fade, then after a delay it 
 Supports single‑click to play/pause anywhere, swipe left/right to skip tracks,
 and double‑click on album / title / artist for dedicated actions.
 Includes smooth crossfade when album art changes.
+Now with a true FFT frequency visualizer (bass to treble bars).
 """
 
 import sys
 import os
 import time
+
 from PyQt5.QtCore import (
     Qt, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty,
     QTimer, QPauseAnimation, QSequentialAnimationGroup, QParallelAnimationGroup,
@@ -46,12 +48,12 @@ class SpotifyOverlay(QWidget):
     playPauseClicked = pyqtSignal()
     nextClicked = pyqtSignal()
     previousClicked = pyqtSignal()
-    likeClicked = pyqtSignal()          # the user toggled the like button
-    albumDoubleClicked = pyqtSignal()   # double‑click on album art
-    titleClicked = pyqtSignal()         # double‑click on song title
-    artistClicked = pyqtSignal()        # double‑click on artist name
-    volumeChanged = pyqtSignal(float)   # right‑click drag volume change
-    settingsClicked = pyqtSignal()      # tray menu "Settings..."
+    likeClicked = pyqtSignal()
+    albumDoubleClicked = pyqtSignal()
+    titleClicked = pyqtSignal()
+    artistClicked = pyqtSignal(str)
+    volumeChanged = pyqtSignal(float)
+    settingsClicked = pyqtSignal()
 
     # ---------- Window constants ----------
     WIDTH = 400
@@ -82,12 +84,7 @@ class SpotifyOverlay(QWidget):
 
     ICON_COLOR = QColor(255, 255, 255)
 
-    BUTTON_SPACING = 14
-    BUTTON_BASE_SIZE = 28
-    BUTTON_PADDING = 6
-    BUTTON_RIGHT_MARGIN = 14
-    BUTTON_ALPHA_INACTIVE = 0.9
-    BUTTON_ALPHA_HOVER = 1.0
+    # ---------- Button layout & animation ----------
 
     BUTTONS = [
         ("previous", 0.4),
@@ -96,10 +93,24 @@ class SpotifyOverlay(QWidget):
         ("like",    0.5),
     ]
 
+    BUTTON_SPACING = 14
+    BUTTON_BASE_SIZE = 28
+    BUTTON_PADDING = 6
+    BUTTON_RIGHT_MARGIN = 14
+    BUTTON_ALPHA_INACTIVE = 0.9
+    BUTTON_ALPHA_HOVER = 1.0
+    BUTTON_PRESS_ALPHA = 0.5
     BTN_ANIM_SPEED = 0.25
+
+    # ---------- Button icon crossfade & bounce ----------
+    BUTTON_CROSSFADE_SPEED = 0.5   # speed of play/pause or like icon transition
+    BUTTON_SCALE_SPEED = 0.3        # damping factor for scale bounce
+    BUTTON_BOUNCE_SCALE_DOWN = 0.9 # shrink ratio on press or state change
+    BUTTON_NORMAL_SCALE = 1.0       # rest scale
+
     CACHE_SCALE = 2
 
-    ALBUM_DOUBLE_CLICK_THRESHOLD = 0.2   # seconds for manual double‑click detection
+    ALBUM_DOUBLE_CLICK_THRESHOLD = 0.2
 
     VOLUME_BAR_WIDTH = 100
     VOLUME_BAR_HEIGHT = 2
@@ -108,28 +119,36 @@ class SpotifyOverlay(QWidget):
     VOLUME_BAR_BG_COLOR = QColor(255, 255, 255, 60)
 
     # ---------- Text layout constants ----------
-    ALBUM_SIZE_RANGE = (10, 40)          # min / max album art size
+    ALBUM_SIZE_RANGE = (10, 40)
     ALBUM_LEFT_MARGIN = 8
-    TEXT_LEFT_MARGIN = 12               # distance from album to text
+    TEXT_LEFT_MARGIN = 12
     TITLE_FONT_SIZE = 11
     ARTIST_FONT_SIZE = 9
     ARTIST_COLOR_NORMAL = QColor(160, 160, 160)
     ARTIST_COLOR_HOVER = QColor(255, 255, 255)
 
     # ---------- Carousel constants ----------
-    CAROUSEL_DELAY = 0.2               # seconds before scroll starts
-    CAROUSEL_END_WAIT = 2.0            # seconds wait at the end
-    CAROUSEL_SPEED = 50                # pixels per second
+    CAROUSEL_DELAY = 0.2
+    CAROUSEL_END_WAIT = 2.0
+    CAROUSEL_SPEED = 50
 
     # ---------- Fade effect ----------
-    FADE_WIDTH = 30                    # width of the gradient fade on the right edge
+    FADE_WIDTH = 30
 
     # ---------- Swipe constants ----------
-    SWIPE_THRESHOLD_PX = 80            # minimum drag distance to trigger skip (live threshold)
-    SWIPE_VELOCITY_THRESHOLD = 200     # pixels/second (fallback flick)
-    SWIPE_DEAD_ZONE = 10               # movement before a press becomes a swipe
-    SWIPE_SNAP_DURATION = 250          # ms for snap-back animation
+    SWIPE_THRESHOLD_PX = 80
+    SWIPE_VELOCITY_THRESHOLD = 200
+    SWIPE_DEAD_ZONE = 10
+    SWIPE_SNAP_DURATION = 250
     POST_SWIPE_DELAY_MS = 1000
+
+    # ---------- EQ Visualizer Settings ----------
+    EQ_NUM_BARS = 7
+    EQ_BAR_WIDTH = 4.0
+    EQ_BAR_GAP = 4.0
+    EQ_MAX_ADDITIONAL_HEIGHT = 18.0
+    EQ_ATTACK_SPEED = 0.5
+    EQ_DECAY_SPEED = 0.15
 
     def __init__(self):
         super().__init__()
@@ -152,34 +171,50 @@ class SpotifyOverlay(QWidget):
         self._current_volume = 0.5
         self._anim_volume = 0.5
 
+        self._fft_bands = [0.0] * self.EQ_NUM_BARS
+
+        # ---------- Artist tracking ----------
+        self._artists_data = []
+        self._artist_spans = []
+        self._hovered_artist_index = -1
+
         self._song_title = "Song Title"
         self._artist = "Artist Name"
         self._album_pixmap = None
-        self._old_album_pixmap = None          # previous cover for crossfade
-        self._album_crossfade = 1.0            # 1.0 = fully transitioned to new cover
+        self._old_album_pixmap = None
+        self._album_crossfade = 1.0
 
         # Text hover states
         self._hovering_title = False
         self._hovering_artist = False
-        self._title_rect = QRectF()      # set during paint
+        self._title_rect = QRectF()
         self._artist_rect = QRectF()
 
         # Button interaction
         self._hovered_btn_index = -1
         self._pressed_btn_index = -1
         self._btn_states = []
-        for _ in self.BUTTONS:
+        
+        initial_state_map = self._state_map()
+        for key, scale in self.BUTTONS:
+            actual_key = initial_state_map.get(key, key)
             self._btn_states.append({
                 'current_alpha': self.BUTTON_ALPHA_INACTIVE,
                 'target_alpha': self.BUTTON_ALPHA_INACTIVE,
+                'current_scale': self.BUTTON_NORMAL_SCALE,
+                'target_scale': self.BUTTON_NORMAL_SCALE,
                 'last_change': time.time(),
-                'press_time': 0.0
+                'press_time': 0.0,
+                'current_icon': actual_key,
+                'old_icon': actual_key,
+                'crossfade': 1.0
             })
 
-        # Double‑click timers (manual time tracking)
+        # Double‑click timers
         self._last_album_click_time = 0.0
         self._last_title_click_time = 0.0
         self._last_artist_click_time = 0.0
+        self._last_background_click_time = 0.0
 
         # Right‑click volume drag
         self._right_dragging = False
@@ -193,11 +228,11 @@ class SpotifyOverlay(QWidget):
         self._swipe_last_pos = QPointF()
         self._swipe_last_time = 0.0
         self._swipe_velocity = 0.0
-        self._swipe_anim = None          # keep reference to avoid garbage collection
-        self._swipe_triggered = False    # True if the action already fired mid‑swipe
-        self._post_swipe_delay = False   # 1‑second grace period after swipe
+        self._swipe_anim = None
+        self._swipe_triggered = False
+        self._post_swipe_delay = False
 
-        self._press_region = None          # 'album', 'title', 'artist', 'background'
+        self._press_region = None
         self._click_timer = QTimer(self)
         self._click_timer.setSingleShot(True)
         self._click_timer.timeout.connect(self._on_single_click_timer)
@@ -237,12 +272,10 @@ class SpotifyOverlay(QWidget):
         self._panel_album_size = int(max(10, min(self.PANEL_HEIGHT - 6, 40)))
         self._text_x_offset = self.ALBUM_LEFT_MARGIN + self._panel_album_size + self.TEXT_LEFT_MARGIN
         
-        # Dynamically calculate the total pixel width of the playback buttons
         buttons_w = sum(int(self.BUTTON_BASE_SIZE * scale) for _, scale in self.BUTTONS)
         spacing_w = self.BUTTON_SPACING * (len(self.BUTTONS) - 1)
         self._controls_width = buttons_w + spacing_w
         
-        # 16 is an arbitrary padding value so the text doesn't touch the first button's bounding box
         text_to_button_padding = 16 
         
         self._max_text_width = (
@@ -252,16 +285,15 @@ class SpotifyOverlay(QWidget):
             - self.BUTTON_RIGHT_MARGIN 
             - text_to_button_padding
         )
-        # Full widths of strings (updated on track change)
         self._title_full_width = 0.0
         self._artist_full_width = 0.0
 
         # ---------- Carousel state ----------
         def new_carousel_state():
             return {
-                'state': 'idle',           # idle, waiting, scrolling, wait_end
+                'state': 'idle',
                 'hover_start_time': 0.0,
-                'scroll_start_time': 0.0,  # when the scrolling actually starts
+                'scroll_start_time': 0.0,
                 'wait_end_start_time': 0.0,
                 'scroll_offset': 0.0,
             }
@@ -311,10 +343,7 @@ class SpotifyOverlay(QWidget):
         prev_pix.setDevicePixelRatio(self.CACHE_SCALE)
         self._icons["previous"] = prev_pix
 
-        # Initialize text cache correctly at startup
         self._compute_full_widths()
-
-        # ---------- Pre‑rendered static cache (background + album art only) ----------
         self._create_static_cache()
 
         # ---------- Timers ----------
@@ -326,10 +355,9 @@ class SpotifyOverlay(QWidget):
         self._vol_anim_timer.timeout.connect(self._smooth_volume_step)
         self._vol_anim_timer.start(30)
 
-        # Increased frequency for buttery smooth carousel
         self._carousel_timer = QTimer(self)
         self._carousel_timer.timeout.connect(self._update_carousels)
-        self._carousel_timer.start(16)   # ~60 fps
+        self._carousel_timer.start(16)
 
         # Keep window above taskbar
         self._raise_timer = QTimer(self)
@@ -361,12 +389,16 @@ class SpotifyOverlay(QWidget):
 
     # ---------- Public update slots ----------
     def set_playing(self, playing: bool):
-        self._is_playing = playing
-        self.update()
+        if self._is_playing != playing:
+            self._is_playing = playing
+            self._refresh_button_icons()
+            self.update()
 
     def set_liked(self, liked: bool):
-        self._is_liked = liked
-        self.update()
+        if self._is_liked != liked:
+            self._is_liked = liked
+            self._refresh_button_icons()
+            self.update()
 
     def set_track_info(self, title: str, artist: str, image_bytes: QByteArray = QByteArray()):
         if title:
@@ -375,7 +407,10 @@ class SpotifyOverlay(QWidget):
             self._song_title = "Unknown Title"
         self._artist = artist if artist else ""
 
-        # Save current pixmap as old for crossfade
+        # Fallback single artist until real array arrives
+        self._artists_data = [{"name": self._artist, "uri": ""}]
+        self._hovered_artist_index = -1
+
         self._old_album_pixmap = self._album_pixmap
 
         if not image_bytes.isEmpty():
@@ -391,17 +426,15 @@ class SpotifyOverlay(QWidget):
         self._title_car['state'] = 'idle'
         self._artist_car['state'] = 'idle'
 
-        # Trigger the crossfade animation (250ms duration)
         self._album_crossfade = 0.0
         
-        # Stop any currently running fade if the user is swiping super fast
         if hasattr(self, '_fade_anim') and self._fade_anim.state() == QPropertyAnimation.Running:
             self._fade_anim.stop()
 
         self._fade_anim = QPropertyAnimation(self, b"album_crossfade")
         self._fade_anim.setDuration(250)
-        self._fade_anim.setStartValue(0.0)  # <-- Added this!
-        self._fade_anim.setEndValue(1.0)    # <-- Added this!
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
         self._fade_anim.setEasingCurve(QEasingCurve.InOutQuad)
         self._fade_anim.start()
 
@@ -410,6 +443,32 @@ class SpotifyOverlay(QWidget):
 
     def set_volume(self, volume: float):
         self._current_volume = max(0.0, min(1.0, volume))
+
+    def set_fft_bands(self, bands: list):
+        """Receives frequency bands and applies custom attack/decay smoothing."""
+        if not bands or len(bands) != self.EQ_NUM_BARS:
+            return
+
+        for i in range(self.EQ_NUM_BARS):
+            target = bands[i] if self._is_playing else 0.0
+            current = self._fft_bands[i]
+            
+            if target > current:
+                self._fft_bands[i] += (target - current) * self.EQ_ATTACK_SPEED
+            else:
+                self._fft_bands[i] += (target - current) * self.EQ_DECAY_SPEED
+            
+        if self._morph_progress < 1.0:
+            self.update()
+
+    def set_artists(self, artists: list):
+        """Called when the background lookup returns the real artist array."""
+        if not artists:
+            return
+        self._artists_data = artists
+        self._artist = ", ".join(a["name"] for a in artists)
+        self._compute_full_widths()
+        self.update()
 
     # ---------- Private helpers ----------
     def _recolor_pixmap(self, pixmap, color):
@@ -452,7 +511,61 @@ class SpotifyOverlay(QWidget):
         artist_font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
         artist_font.setHintingPreference(QFont.PreferNoHinting)
         artist_fm = QFontMetrics(artist_font)
-        self._artist_full_width = artist_fm.width(self._artist) if self._artist else 0
+
+        # Build spans for each artist + separator
+        self._artist_spans = []
+        current_x = 0.0
+        
+        for i, artist_dict in enumerate(self._artists_data):
+            name = artist_dict.get("name", "")
+            uri = artist_dict.get("uri", "")
+            w = artist_fm.width(name)
+            
+            self._artist_spans.append({
+                "text": name, "is_link": True, "uri": uri,
+                "start_x": current_x, "width": w, "index": i
+            })
+            current_x += w
+            
+            if i < len(self._artists_data) - 1:
+                sep = ", "
+                sep_w = artist_fm.width(sep)
+                self._artist_spans.append({
+                    "text": sep, "is_link": False, "uri": "",
+                    "start_x": current_x, "width": sep_w, "index": -1
+                })
+                current_x += sep_w
+                
+        self._artist_full_width = current_x
+
+    def _check_artist_hitbox(self, pos=None) -> bool:
+        """
+        Calculates if the mouse is hovering a specific artist span.
+        Returns True if the hovered artist changed, triggering a UI repaint.
+        """
+        if not hasattr(self, '_artist_rect') or not self._artist_rect.isValid():
+            return False
+
+        if pos is None:
+            pos = self.mapFromGlobal(QCursor.pos())
+
+        hovered_artist_idx = -1
+        
+        if self._artist_rect.contains(pos):
+            offset = self._artist_car['scroll_offset'] if self._artist_car['state'] != 'idle' else 0.0
+            local_x = pos.x() - self._artist_rect.x() + offset
+            
+            for span in self._artist_spans:
+                if span["is_link"] and span["start_x"] <= local_x <= (span["start_x"] + span["width"]):
+                    hovered_artist_idx = span["index"]
+                    break
+
+        current_hover = getattr(self, '_hovered_artist_index', -1)
+        if hovered_artist_idx != current_hover:
+            self._hovered_artist_index = hovered_artist_idx
+            return True
+            
+        return False
 
     def _create_static_cache(self):
         cache_w = self.WIDTH * self.CACHE_SCALE
@@ -482,33 +595,42 @@ class SpotifyOverlay(QWidget):
         painter.save()
         painter.setClipPath(path)
 
-        # Helper to scale correctly
         def get_scaled(pix):
             size = int(album_size * self.CACHE_SCALE)
             s = pix.scaled(size, size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             s.setDevicePixelRatio(self.CACHE_SCALE)
             return s
 
-        # Crossfade: if animation not finished and old image exists
         if self._album_crossfade < 1.0 and self._old_album_pixmap and not self._old_album_pixmap.isNull():
-            # Draw old image fading out
             painter.setOpacity((1.0 - self._album_crossfade) * (alpha / 255.0))
             painter.drawPixmap(album_rect.topLeft(), get_scaled(self._old_album_pixmap))
 
-            # Draw new image fading in
             if self._album_pixmap and not self._album_pixmap.isNull():
                 painter.setOpacity(self._album_crossfade * (alpha / 255.0))
                 painter.drawPixmap(album_rect.topLeft(), get_scaled(self._album_pixmap))
         else:
-            # Normal drawing (no old image or animation complete)
             painter.setOpacity(alpha / 255.0)
             if self._album_pixmap and not self._album_pixmap.isNull():
                 painter.drawPixmap(album_rect.topLeft(), get_scaled(self._album_pixmap))
 
         painter.restore()
 
-    # ---------- Text drawing (with immediate full text on hover) ----------
-    # (Unchanged from previous version)
+    def _refresh_button_icons(self):
+        """Checks for state changes and triggers crossfades with bounce."""
+        state_map = self._state_map()
+        for idx, (base_key, _) in enumerate(self.BUTTONS):
+            new_key = state_map.get(base_key, base_key)
+            state = self._btn_states[idx]
+            
+            if state['current_icon'] != new_key:
+                state['old_icon'] = state['current_icon']
+                state['current_icon'] = new_key
+                state['crossfade'] = 0.0
+                
+                state['current_scale'] = self.BUTTON_BOUNCE_SCALE_DOWN
+                state['target_scale'] = self.BUTTON_NORMAL_SCALE
+
+    # ---------- Text drawing ----------
     def _draw_text_overlay(self, painter: QPainter, panel_rect: QRectF, alpha: int):
         x, y, w, h = panel_rect.x(), panel_rect.y(), panel_rect.width(), panel_rect.height()
         if h <= 0:
@@ -556,15 +678,17 @@ class SpotifyOverlay(QWidget):
         car = self._title_car
         show_full = (self._title_full_width > max_text_width and car['state'] != 'idle')
         if show_full:
+            car['true_max_offset'] = self._title_full_width - max_text_width + self.FADE_WIDTH
+            
             if car['state'] == 'scrolling':
                 elapsed = time.time() - car['scroll_start_time']
-                max_offset = self._title_full_width - max_text_width + self.FADE_WIDTH
-                offset = min(max_offset, elapsed * self.CAROUSEL_SPEED)
+                offset = min(car['true_max_offset'], elapsed * self.CAROUSEL_SPEED)
             elif car['state'] == 'wait_end':
-                offset = self._title_full_width - max_text_width + self.FADE_WIDTH
+                offset = car['true_max_offset']
             else:
                 offset = 0.0
         else:
+            car['true_max_offset'] = 0.0
             offset = 0.0
 
         if show_full:
@@ -591,7 +715,7 @@ class SpotifyOverlay(QWidget):
             painter.setPen(title_color)
             painter.drawText(title_visible_rect, Qt.AlignLeft | Qt.AlignVCenter, truncated_title)
 
-        # Underline (scrolls with text, fades too)
+        # Underline
         if self._hovering_title:
             underline_y = int(title_visible_rect.bottom()) - 2
             painter.save()
@@ -624,65 +748,62 @@ class SpotifyOverlay(QWidget):
                 )
             painter.restore()
 
-        # ---- Artist ----
+        # ---- Artist (dynamic spans) ----
         if self._artist:
             painter.setFont(artist_font)
-            truncated_artist = self._truncate_text(painter, self._artist, max_text_width)
-
-            if self._artist_full_width > max_text_width:
-                actual_artist_width = max_text_width
-            else:
-                actual_artist_width = artist_fm.width(self._artist)
-
-            artist_visible_rect = QRectF(text_x, start_y + title_height + spacing,
-                                         actual_artist_width, artist_height)
+            
+            actual_artist_width = min(self._artist_full_width, max_text_width)
+            artist_visible_rect = QRectF(text_x, start_y + title_height + spacing, actual_artist_width, artist_height)
             self._artist_rect = artist_visible_rect
 
-            artist_color = self.ARTIST_COLOR_HOVER if self._hovering_artist else QColor(
-                self.ARTIST_COLOR_NORMAL.red(),
-                self.ARTIST_COLOR_NORMAL.green(),
-                self.ARTIST_COLOR_NORMAL.blue(),
-                alpha
-            )
-
             car = self._artist_car
-            show_full_artist = (self._artist_full_width > max_text_width and car['state'] != 'idle')
-            if show_full_artist:
+            offset = 0.0
+            
+            if self._artist_full_width > max_text_width:
+                car['true_max_offset'] = self._artist_full_width - max_text_width + self.FADE_WIDTH
+                
                 if car['state'] == 'scrolling':
                     elapsed = time.time() - car['scroll_start_time']
-                    max_offset = self._artist_full_width - max_text_width + self.FADE_WIDTH
-                    offset = min(max_offset, elapsed * self.CAROUSEL_SPEED)
+                    offset = min(car['true_max_offset'], elapsed * self.CAROUSEL_SPEED)
                 elif car['state'] == 'wait_end':
-                    offset = self._artist_full_width - max_text_width + self.FADE_WIDTH
-                else:
-                    offset = 0.0
+                    offset = car['true_max_offset']
             else:
-                offset = 0.0
+                car['true_max_offset'] = 0.0
 
-            if show_full_artist:
-                painter.save()
-                painter.setClipRect(artist_visible_rect)
+            painter.save()
+            painter.setClipRect(artist_visible_rect)
+            
+            for span in self._artist_spans:
+                span_rect = QRectF(text_x - offset + span["start_x"], start_y + title_height + spacing, span["width"], artist_height)
+                
+                if span_rect.right() < artist_visible_rect.left() or span_rect.left() > artist_visible_rect.right():
+                    continue
 
-                gradient = QLinearGradient(
-                    artist_visible_rect.right() - self.FADE_WIDTH, 0,
-                    artist_visible_rect.right(), 0
+                is_hovered = span["is_link"] and span["index"] == getattr(self, '_hovered_artist_index', -1)
+                base_color = self.ARTIST_COLOR_HOVER if is_hovered else QColor(
+                    self.ARTIST_COLOR_NORMAL.red(),
+                    self.ARTIST_COLOR_NORMAL.green(),
+                    self.ARTIST_COLOR_NORMAL.blue(),
+                    alpha
                 )
-                transparent_artist = QColor(artist_color)
-                transparent_artist.setAlpha(0)
-                gradient.setColorAt(0, artist_color)
-                gradient.setColorAt(1, transparent_artist)
-
-                pen = QPen()
-                pen.setBrush(QBrush(gradient))
+                
+                if self._artist_full_width > max_text_width:
+                    grad = QLinearGradient(
+                        artist_visible_rect.right() - self.FADE_WIDTH, 0,
+                        artist_visible_rect.right(), 0
+                    )
+                    t_color = QColor(base_color)
+                    t_color.setAlpha(0)
+                    grad.setColorAt(0, base_color)
+                    grad.setColorAt(1, t_color)
+                    pen = QPen(QBrush(grad), 1)
+                else:
+                    pen = QPen(base_color)
+                    
                 painter.setPen(pen)
+                painter.drawText(span_rect, Qt.AlignLeft | Qt.AlignVCenter, span["text"])
 
-                text_rect = QRectF(text_x - offset, start_y + title_height + spacing,
-                                   self._artist_full_width, artist_height)
-                painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, self._artist)
-                painter.restore()
-            else:
-                painter.setPen(artist_color)
-                painter.drawText(artist_visible_rect, Qt.AlignLeft | Qt.AlignVCenter, truncated_artist)
+            painter.restore()
         else:
             self._artist_rect = QRectF()
 
@@ -715,7 +836,9 @@ class SpotifyOverlay(QWidget):
         self._anim_hover.start()
 
     def _get_morph_progress(self): return self._morph_progress
-    def _set_morph_progress(self, v): self._morph_progress = v; self.update()
+    def _set_morph_progress(self, v):
+        self._morph_progress = v
+        self.update()
     morph_progress = pyqtProperty(float, _get_morph_progress, _set_morph_progress)
 
     def _get_rise_progress(self): return self._rise_progress
@@ -782,11 +905,11 @@ class SpotifyOverlay(QWidget):
         now = time.time()
         changed = False
 
-        # Title carousel
+        # --- Title Carousel ---
         car = self._title_car
-        max_vis = self._max_text_width
-        full_w = self._title_full_width
-        if full_w > max_vis:
+        max_offset = car.get('true_max_offset', 0.0)
+        
+        if max_offset > 0:
             state = car['state']
             if state == 'waiting':
                 if now - car['hover_start_time'] >= self.CAROUSEL_DELAY:
@@ -796,7 +919,6 @@ class SpotifyOverlay(QWidget):
                     changed = True
             elif state == 'scrolling':
                 elapsed = now - car['scroll_start_time']
-                max_offset = full_w - max_vis + self.FADE_WIDTH
                 new_offset = min(max_offset, elapsed * self.CAROUSEL_SPEED)
                 if abs(new_offset - car['scroll_offset']) > 0.1:
                     car['scroll_offset'] = new_offset
@@ -817,10 +939,11 @@ class SpotifyOverlay(QWidget):
                 car['scroll_offset'] = 0.0
                 changed = True
 
-        # Artist carousel (identical logic)
+        # --- Artist Carousel (Identical Logic) ---
         car = self._artist_car
-        full_w = self._artist_full_width
-        if full_w > max_vis:
+        max_offset = car.get('true_max_offset', 0.0)
+        
+        if max_offset > 0:
             state = car['state']
             if state == 'waiting':
                 if now - car['hover_start_time'] >= self.CAROUSEL_DELAY:
@@ -830,7 +953,6 @@ class SpotifyOverlay(QWidget):
                     changed = True
             elif state == 'scrolling':
                 elapsed = now - car['scroll_start_time']
-                max_offset = full_w - max_vis
                 new_offset = min(max_offset, elapsed * self.CAROUSEL_SPEED)
                 if abs(new_offset - car['scroll_offset']) > 0.1:
                     car['scroll_offset'] = new_offset
@@ -852,26 +974,23 @@ class SpotifyOverlay(QWidget):
                 changed = True
 
         if changed:
+            self._check_artist_hitbox()
             self.update()
 
     # ---------- Single‑click / swipe helpers ----------
     def _on_single_click_timer(self):
-        """Called when no second click arrives – treat as a single click → toggle play/pause."""
         print("[SpotifyOverlay] Single-click detected: Toggling Play/Pause.")
         self.playPauseClicked.emit()
         self._press_region = None
 
     def _start_single_click_detection(self, region: str):
-        """Start the timer that will emit playPauseClicked after a double‑click timeout."""
         timeout_ms = int(self.ALBUM_DOUBLE_CLICK_THRESHOLD * 1000)
         self._click_timer.start(timeout_ms)
 
     def _cancel_single_click_detection(self):
         self._click_timer.stop()
-        # Do NOT clear self._press_region here – that would kill the swipe tracking.
 
     def _region_from_pos(self, pos):
-        """Return which clickable region the point falls into."""
         if self._get_album_rect().contains(pos):
             return 'album'
         if self._title_rect.isValid() and self._title_rect.contains(pos):
@@ -881,7 +1000,6 @@ class SpotifyOverlay(QWidget):
         return 'background'
 
     def _collapse_panel(self):
-        """Helper to hide the panel and reset hover/carousel states."""
         self._animate_hover(0.0)
         if self._expanded:
             self._expanded = False
@@ -892,6 +1010,7 @@ class SpotifyOverlay(QWidget):
 
             self._hovering_title = False
             self._hovering_artist = False
+            self._hovered_artist_index = -1
             self._title_car['state'] = 'idle'
             self._title_car['scroll_offset'] = 0.0
             self._artist_car['state'] = 'idle'
@@ -899,10 +1018,8 @@ class SpotifyOverlay(QWidget):
             self.update()
 
     def _check_delayed_collapse(self):
-        """Called 1 second after releasing a swipe outside the boundaries."""
         self._post_swipe_delay = False
         
-        # Check where the cursor currently is globally
         pos = self.mapFromGlobal(QCursor.pos())
         if not self.rect().contains(pos) and not getattr(self, '_right_dragging', False):
             self._collapse_panel()
@@ -916,14 +1033,14 @@ class SpotifyOverlay(QWidget):
             self.update()
             return
 
-        if event.button() == Qt.LeftButton and self._expanded:   # no more _rise_progress check
+        if event.button() == Qt.LeftButton and self._expanded:
             pos = event.pos()
 
-            # Buttons – keep the immediate action
             idx = self._button_index_at(pos)
             if idx >= 0:
                 self._pressed_btn_index = idx
-                self._btn_states[idx]['target_alpha'] = 0.5
+                self._btn_states[idx]['target_alpha'] = self.BUTTON_PRESS_ALPHA
+                self._btn_states[idx]['target_scale'] = self.BUTTON_BOUNCE_SCALE_DOWN
                 self._btn_states[idx]['last_change'] = time.time()
                 QTimer.singleShot(100, lambda i=idx: self._on_press_release(i))
 
@@ -939,7 +1056,6 @@ class SpotifyOverlay(QWidget):
                 self.update()
                 return
 
-            # ---- Double Click Detection (Manual Time Tracking) ----
             now = time.time()
             region = self._region_from_pos(pos)
             is_double_click = False
@@ -960,11 +1076,21 @@ class SpotifyOverlay(QWidget):
                     self._last_title_click_time = now
             elif region == 'artist':
                 if now - self._last_artist_click_time <= self.ALBUM_DOUBLE_CLICK_THRESHOLD:
-                    self.artistClicked.emit()
+                    uri = ""
+                    if getattr(self, '_hovered_artist_index', -1) >= 0 and self._hovered_artist_index < len(self._artists_data):
+                        uri = self._artists_data[self._hovered_artist_index].get("uri", "")
+                    self.artistClicked.emit(uri)
                     self._last_artist_click_time = 0.0
                     is_double_click = True
                 else:
                     self._last_artist_click_time = now
+            elif region == 'background':
+                if now - self._last_background_click_time <= self.ALBUM_DOUBLE_CLICK_THRESHOLD:
+                    self.likeClicked.emit()
+                    self._last_background_click_time = 0.0
+                    is_double_click = True
+                else:
+                    self._last_background_click_time = now
 
             if is_double_click:
                 self._cancel_single_click_detection()
@@ -972,7 +1098,6 @@ class SpotifyOverlay(QWidget):
                 self.update()
                 return
 
-            # ---- Anything else – start swipe tracking ----
             self._press_region = region
             self._swipe_start_pos = pos
             self._swipe_last_pos = pos
@@ -987,7 +1112,6 @@ class SpotifyOverlay(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        # 1. Update boundary check: Don't collapse if we are actively dragging/swiping
         is_interacting = (getattr(self, '_swipe_active', False) or
                           getattr(self, '_right_dragging', False) or
                           getattr(self, '_post_swipe_delay', False))
@@ -1005,7 +1129,6 @@ class SpotifyOverlay(QWidget):
 
         pos = event.pos()
 
-        # ---- Swipe logic (Live Threshold) ----
         if (event.buttons() & Qt.LeftButton) and self._press_region is not None:
             delta = pos - self._swipe_start_pos
             if not self._swipe_active:
@@ -1023,7 +1146,6 @@ class SpotifyOverlay(QWidget):
                 self._swipe_last_pos = pos
                 self._swipe_last_time = now
 
-                # Live threshold trigger during the drag!
                 if not self._swipe_triggered:
                     if self._swipe_offset > self.SWIPE_THRESHOLD_PX:
                         self.previousClicked.emit()
@@ -1035,16 +1157,19 @@ class SpotifyOverlay(QWidget):
                 self.update()
                 return
 
-        # ---- Hover, button highlighting, activation (existing code) ----
         if self._expanded:
             self._update_button_hover(pos)
 
             hovering_title = False
             hovering_artist = False
+
             if self._title_rect.isValid() and self._title_rect.contains(pos):
                 hovering_title = True
             elif self._artist_rect.isValid() and self._artist_rect.contains(pos):
                 hovering_artist = True
+
+            if self._check_artist_hitbox(pos):
+                self.update()
 
             if hovering_title != self._hovering_title:
                 if hovering_title:
@@ -1087,18 +1212,15 @@ class SpotifyOverlay(QWidget):
             return
 
         if event.button() == Qt.LeftButton:
-            # ---- Swipe completion ----
             if getattr(self, '_swipe_active', False):
                 self._swipe_active = False
                 
-                # Fallback: Only check flick velocity if the distance threshold wasn't already triggered
                 if not getattr(self, '_swipe_triggered', False):
                     if self._swipe_velocity > self.SWIPE_VELOCITY_THRESHOLD:
                         self.previousClicked.emit()
                     elif self._swipe_velocity < -self.SWIPE_VELOCITY_THRESHOLD:
                         self.nextClicked.emit()
 
-                # Animate back to 0
                 self._swipe_anim = QPropertyAnimation(self, b"swipe_offset")
                 self._swipe_anim.setDuration(self.SWIPE_SNAP_DURATION)
                 self._swipe_anim.setEasingCurve(QEasingCurve.OutCubic)
@@ -1109,13 +1231,11 @@ class SpotifyOverlay(QWidget):
                 self._press_region = None
                 self._swipe_triggered = False
                 
-                # Flat 1-second delay after ANY swipe finishes before allowing collapse
                 self._post_swipe_delay = True
                 QTimer.singleShot(self.POST_SWIPE_DELAY_MS, self._check_delayed_collapse)
                 
                 return
 
-            # ---- Single-click handling ----
             if self._press_region is not None:
                 timeout_ms = int(self.ALBUM_DOUBLE_CLICK_THRESHOLD * 1000)
                 self._click_timer.start(timeout_ms)
@@ -1125,7 +1245,6 @@ class SpotifyOverlay(QWidget):
         super().mouseReleaseEvent(event)
 
     def leaveEvent(self, event):
-        # Prevent collapsing if we are actively interacting/dragging or in the 1‑second grace period
         if (getattr(self, '_swipe_active', False) or
             getattr(self, '_right_dragging', False) or
             getattr(self, '_post_swipe_delay', False)):
@@ -1140,6 +1259,8 @@ class SpotifyOverlay(QWidget):
             self._btn_states[idx]['target_alpha'] = self.BUTTON_ALPHA_HOVER
         else:
             self._btn_states[idx]['target_alpha'] = self.BUTTON_ALPHA_INACTIVE
+            
+        self._btn_states[idx]['target_scale'] = self.BUTTON_NORMAL_SCALE
         self._btn_states[idx]['last_change'] = time.time()
         self._pressed_btn_index = -1
 
@@ -1155,7 +1276,6 @@ class SpotifyOverlay(QWidget):
             
         w, h = self.width(), self.height()
         
-        # Calculate actual Y position during animation so buttons are clickable mid-rise
         offset = self.PANEL_HEIGHT * self._rise_progress
         panel_y_top = h - offset
         
@@ -1204,15 +1324,30 @@ class SpotifyOverlay(QWidget):
             state['last_change'] = now
 
     def _update_button_animations(self):
-        now = time.time()
-        speed = self.BTN_ANIM_SPEED
         updated = False
+        
         for state in self._btn_states:
-            cur = state['current_alpha']
-            target = state['target_alpha']
-            if abs(cur - target) > 0.001:
-                state['current_alpha'] += (target - cur) * speed
+            # Alpha smoothing
+            cur_a = state['current_alpha']
+            tgt_a = state['target_alpha']
+            if abs(cur_a - tgt_a) > 0.001:
+                state['current_alpha'] += (tgt_a - cur_a) * self.BTN_ANIM_SPEED
                 updated = True
+                
+            # Scale bounce
+            cur_s = state['current_scale']
+            tgt_s = state['target_scale']
+            if abs(cur_s - tgt_s) > 0.001:
+                state['current_scale'] += (tgt_s - cur_s) * self.BUTTON_SCALE_SPEED
+                updated = True
+                
+            # Icon crossfade
+            if state['crossfade'] < 1.0:
+                state['crossfade'] += self.BUTTON_CROSSFADE_SPEED
+                if state['crossfade'] > 1.0:
+                    state['crossfade'] = 1.0
+                updated = True
+                
         if updated:
             self.update()
 
@@ -1238,8 +1373,8 @@ class SpotifyOverlay(QWidget):
 
         if pr > 0.0:
             full_rect = QRectF(0, h, w, self.PANEL_HEIGHT)
-            content_rect = full_rect.translated(0, -offset)            # vertical rise
-            content_rect.translate(self._swipe_offset, 0)             # horizontal swipe
+            content_rect = full_rect.translated(0, -offset)
+            content_rect.translate(self._swipe_offset, 0)
             painter.save()
             painter.setClipRect(QRectF(0, 0, w, h))
             panel_alpha = int(255 * min(1.0, pr * 1.5))
@@ -1256,7 +1391,9 @@ class SpotifyOverlay(QWidget):
             painter.setOpacity(1.0)
             painter.restore()
 
-        # Dot / Bar (unchanged)
+        # ---------------------------------------------------------
+        # Dot / True FFT EQ Bar 
+        # ---------------------------------------------------------
         base_w = self.REST_CHILD_WIDTH + (self.CHILD_WIDTH - self.REST_CHILD_WIDTH) * ph
         base_h = self.CHILD_HEIGHT
         base_r = int(self.REST_CHILD_R + (self.CHILD_R - self.REST_CHILD_R) * ph)
@@ -1284,12 +1421,49 @@ class SpotifyOverlay(QWidget):
         final_a = int(base_a + (circle_a - base_a) * snap)
 
         dot_y = dot_y_rest - offset
-        dot_rect = QRectF(w/2 - final_w/2, dot_y - final_h/2, final_w, final_h)
-        dot_path = QPainterPath()
-        dot_path.addRoundedRect(dot_rect, final_radius, final_radius)
-        painter.setBrush(QColor(final_r, final_g, final_b, final_a))
-        painter.setPen(Qt.NoPen)
-        painter.drawPath(dot_path)
+
+        solid_path = QPainterPath()
+        solid_rect = QRectF(w/2 - final_w/2, dot_y - final_h/2, final_w, final_h)
+        solid_path.addRoundedRect(solid_rect, final_radius, final_radius)
+        
+        draw_solid = True
+        draw_eq = False
+        eq_alpha_mult = 1.0
+        solid_alpha_mult = 1.0
+
+        if pm == 0 and ph < 1.0:
+            draw_eq = True
+            eq_alpha_mult = 1.0 - ph   
+            solid_alpha_mult = ph
+
+        if draw_solid and solid_alpha_mult > 0:
+            a = int(final_a * solid_alpha_mult)
+            painter.setBrush(QColor(final_r, final_g, final_b, a))
+            painter.setPen(Qt.NoPen)
+            painter.drawPath(solid_path)
+
+        if draw_eq and eq_alpha_mult > 0:
+            eq_a = int(final_a * eq_alpha_mult)
+            painter.setBrush(QColor(final_r, final_g, final_b, eq_a))
+            painter.setPen(Qt.NoPen)
+            
+            eq_path = QPainterPath()
+            num_bars = self.EQ_NUM_BARS
+            bar_w = self.EQ_BAR_WIDTH
+            gap = self.EQ_BAR_GAP
+            total_w = num_bars * bar_w + (num_bars - 1) * gap
+            start_x = w/2 - total_w/2
+            
+            for i in range(num_bars):
+                band_val = self._fft_bands[i]
+                bar_h = bar_w + (band_val * self.EQ_MAX_ADDITIONAL_HEIGHT)
+                
+                bx = start_x + i * (bar_w + gap)
+                by = dot_y - bar_h / 2
+                radius = bar_w / 2.0 
+                eq_path.addRoundedRect(QRectF(bx, by, bar_w, bar_h), radius, radius)
+                
+            painter.drawPath(eq_path)
 
         parent_rect = QRectF(0, h - parent_height, w, parent_height)
         painter.setBrush(QColor(self.PARENT_R, self.PARENT_G, self.PARENT_B, self.PARENT_ALPHA))
@@ -1319,35 +1493,50 @@ class SpotifyOverlay(QWidget):
         x, y, w, h = panel_rect.x(), panel_rect.y(), panel_rect.width(), panel_rect.height()
         base = self.BUTTON_BASE_SIZE
         spacing = self.BUTTON_SPACING
-        state_map = self._state_map()
 
-        items = []
-        for idx, (key, scale) in enumerate(self.BUTTONS):
-            final = state_map.get(key, key)
-            items.append((final, scale))
-
-        total_w = sum(int(base * s) for _, s in items) + spacing * (len(items) - 1)
+        total_w = sum(int(base * s) for _, s in self.BUTTONS) + spacing * (len(self.BUTTONS) - 1)
         start_x = x + w - total_w - self.BUTTON_RIGHT_MARGIN
         center_y = y + h // 2
 
         cur_x = start_x
-        for idx, (final_key, nominal_scale) in enumerate(items):
+        for idx, (base_key, nominal_scale) in enumerate(self.BUTTONS):
             nominal_size = int(base * nominal_scale)
-            visual_rect = QRectF(cur_x, center_y - nominal_size / 2,
-                                 nominal_size, nominal_size)
+            visual_rect = QRectF(cur_x, center_y - nominal_size / 2, nominal_size, nominal_size)
 
             bg_alpha = int(panel_alpha * 0)
             painter.setBrush(QColor(255, 255, 255, bg_alpha))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(visual_rect, 6, 6)
 
-            pix = self._icons.get(final_key)
-            if pix:
-                icon_alpha = int(panel_alpha * self._btn_states[idx]['current_alpha'])
+            state = self._btn_states[idx]
+            base_icon_alpha = panel_alpha * state['current_alpha'] / 255.0
+            center = visual_rect.center()
+            current_scale = state['current_scale']
+
+            # Old icon fading out
+            if state['crossfade'] < 1.0 and state['old_icon']:
+                old_pix = self._icons.get(state['old_icon'])
+                if old_pix:
+                    painter.save()
+                    painter.translate(center)
+                    painter.scale(current_scale, current_scale)
+                    painter.translate(-center)
+                    painter.setOpacity(base_icon_alpha * (1.0 - state['crossfade']))
+                    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                    painter.drawPixmap(visual_rect.topLeft(), old_pix)
+                    painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+                    painter.restore()
+
+            # Current icon fading in
+            current_pix = self._icons.get(state['current_icon'])
+            if current_pix:
                 painter.save()
-                painter.setOpacity(icon_alpha / 255.0)
+                painter.translate(center)
+                painter.scale(current_scale, current_scale)
+                painter.translate(-center)
+                painter.setOpacity(base_icon_alpha * state['crossfade'])
                 painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-                painter.drawPixmap(visual_rect.topLeft(), pix)
+                painter.drawPixmap(visual_rect.topLeft(), current_pix)
                 painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
                 painter.restore()
 
@@ -1365,8 +1554,8 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     overlay = SpotifyOverlay()
     overlay.titleClicked.connect(lambda: print("Title double‑clicked!"))
-    overlay.artistClicked.connect(lambda: print("Artist double‑clicked!"))
-    overlay.set_track_info("A very long song title that needs to scroll because it's too long", "Artist Name")
+    overlay.artistClicked.connect(lambda uri: print(f"Artist double‑clicked: {uri}"))
+    overlay.set_track_info("A very long song title that needs to scroll because it's too long", "A very long song title that needs to scroll because it's too long")
     overlay.set_playing(True)
     overlay.set_volume(0.7)
     sys.exit(app.exec_())
